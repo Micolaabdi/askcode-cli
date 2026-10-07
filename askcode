@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""askcode — find code by asking what it does.
+
+Walks a codebase, then asks an OpenAI-compatible model which files answer
+your question. Ranked paths + snippets, straight in your terminal.
+
+    askcode "where do we refresh expired sessions?"
+    askcode "which file computes invoice totals" --json
+
+Zero dependencies (Python 3.9+ stdlib only).
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_BASE_URL = os.environ.get("ASKCODE_BASE_URL", "https://atmorouter.dev/v1")
+DEFAULT_MODEL = os.environ.get("ASKCODE_MODEL", "atmo/deepseek-v4.1-flash")
+
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", "target",
+    ".next", ".turbo", "vendor", ".idea", ".vscode", "coverage",
+}
+TEXT_EXT = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb",
+    ".php", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".swift", ".m", ".sh",
+    ".bash", ".zsh", ".sql", ".yaml", ".yml", ".toml", ".json", ".md", ".txt",
+    ".html", ".css", ".scss", ".vue", ".svelte", ".proto", ".tf", ".dockerfile",
+    ".makefile", ".cmake", ".gradle", ".xml", ".env", ".ini", ".cfg", ".conf",
+}
+MAX_FILE_BYTES = 120_000       # skip huge generated files
+CHUNK_LINES = 60              # snippet granularity sent to the model
+MAX_CHUNKS = 120              # hard cap per run (keeps tokens sane)
+LINE_BUDGET = 8000            # total code lines sent in one pass
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def is_text(path, name):
+    if name.lower() in {"dockerfile", "makefile", "rakefile", "gemfile", "procfile"}:
+        return True
+    return os.path.splitext(name)[1].lower() in TEXT_EXT
+
+
+def iter_files(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".git")]
+        for fn in sorted(filenames):
+            if not is_text(dirpath, fn):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(full) > MAX_FILE_BYTES:
+                    continue
+                with open(full, encoding="utf-8", errors="ignore") as fh:
+                    yield os.path.relpath(full, root), fh.read()
+            except OSError:
+                continue
+
+
+def chunk(path, text):
+    """Split a file into labeled chunks; whole small files stay in one chunk."""
+    lines = text.splitlines()
+    if len(lines) <= CHUNK_LINES:
+        return [(path, 1, text)]
+    out = []
+    for i in range(0, len(lines), CHUNK_LINES):
+        out.append((path, i + 1, "\n".join(lines[i:i + CHUNK_LINES])))
+    return out
+
+
+def build_catalog(root):
+    chunks, budget = [], LINE_BUDGET
+    for path, text in iter_files(root):
+        if budget <= 0 or len(chunks) >= MAX_CHUNKS:
+            break
+        for p, start, body in chunk(path, text):
+            chunks.append({"path": p, "start": start, "body": body[:4000]})
+            budget -= body.count("\n") + 1
+    return chunks
+
+
+PROMPT = """You are a code search engine. Below is a catalog of code chunks
+(file path, starting line, code). The user asks a question about the codebase.
+Pick the chunks that answer it and rank them best-first.
+
+Rules:
+- Return ONLY a JSON array, no prose, no markdown fences.
+- Each element: PATH-START-REASON object with keys "path", "start" (line number), "reason" (<=140 chars why it matches).
+- 1 to 8 results. If nothing matches, return [].
+
+Question: QUESTION
+
+Catalog:
+CATALOG"""
+
+
+def ask_model(base_url, model, api_key, question, chunks, timeout):
+    entries = []
+    for c in chunks:
+        head = c["body"][:1400]
+        entries.append(f"### {c['path']}:{c['start']}\n{head}")
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "user", "content": (PROMPT
+                                        .replace("QUESTION", question)
+                                        .replace("CATALOG", "\n\n".join(entries)))},
+        ],
+        "temperature": 0,
+    }).encode()
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}",
+                 # Some gateways sit behind WAFs that 403 the default
+                 # Python-urllib UA; a neutral client UA avoids that.
+                 "User-Agent": "askcode/1.0 (+https://github.com/Micolaabdi/askcode-cli)"},
+    )
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:300]
+        sys.exit(f"askcode: API error {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        sys.exit(f"askcode: cannot reach {base_url}: {e.reason}")
+    content = data["choices"][0]["message"]["content"].strip()
+    usage = data.get("usage", {})
+    return parse_ranking(content, chunks), usage, time.time() - t0
+
+
+def parse_ranking(content, chunks):
+    # tolerate fences / stray prose around the JSON array
+    m = re.search(r"\[.*\]", content, re.S)
+    if not m:
+        return []
+    try:
+        items = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    by_path = {}
+    for c in chunks:
+        by_path.setdefault(c["path"], []).append(c)
+    out = []
+    for it in items[:8]:
+        if not isinstance(it, dict):
+            continue
+        path = str(it.get("path", ""))
+        group = by_path.get(path)
+        if not group:
+            continue
+        start = it.get("start") or group[0]["start"]
+        out.append({"path": path, "start": int(start),
+                    "reason": str(it.get("reason", ""))[:160],
+                    "body": group[0]["body"][:1200]})
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="askcode",
+        description="Find code by asking what it does. Ask an LLM which files answer your question.")
+    ap.add_argument("question", help='e.g. "where do we refresh expired sessions?"')
+    ap.add_argument("--base-url", default=DEFAULT_BASE_URL,
+                    help=f"OpenAI-compatible endpoint (default: {DEFAULT_BASE_URL})")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"model id (default: {DEFAULT_MODEL})")
+    ap.add_argument("--path", default=".", help="project root to scan (default: .)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--timeout", type=int, default=90, help="API timeout seconds")
+    args = ap.parse_args()
+
+    api_key = (os.environ.get("ATMOROUTER_API_KEY")
+               or os.environ.get("ASKCODE_API_KEY")
+               or os.environ.get("OPENAI_API_KEY"))
+    if not api_key:
+        sys.exit("askcode: set ATMOROUTER_API_KEY (or OPENAI_API_KEY for other endpoints).\n"
+                 "Get a free key with a 100M-token free tier at https://atmorouter.dev")
+
+    root = os.path.abspath(args.path)
+    chunks = build_catalog(root)
+    if not chunks:
+        sys.exit("askcode: no readable source files under " + root)
+
+    if not args.json:
+        eprint(f"askcode: scanning {len({c['path'] for c in chunks})} files, "
+               f"{len(chunks)} chunks -> {args.model}")
+
+    results, usage, dt = ask_model(args.base_url, args.model, api_key,
+                                   args.question, chunks, args.timeout)
+    if not results:
+        print("No matches found." if not args.json else "[]")
+        return
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for i, r in enumerate(results, 1):
+            print(f"\n{len(str(i)) and ''}{i}. \033[1m{r['path']}:{r['start']}\033[0m"
+                  f"  \033[2m{r['reason']}\033[0m")
+            first = r["body"].splitlines()[:14]
+            for ln in first:
+                print("   " + ln[:160])
+        tok = usage.get("total_tokens")
+        if tok:
+            eprint(f"\n({tok} tokens, {dt:.1f}s, model {args.model})")
+
+
+if __name__ == "__main__":
+    main()
